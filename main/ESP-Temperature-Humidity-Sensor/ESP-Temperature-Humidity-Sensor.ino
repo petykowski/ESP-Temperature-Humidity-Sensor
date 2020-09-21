@@ -11,6 +11,7 @@ float humidity;
 
 #define MS_TO_S_FACTOR 1000000
 #define TIME_TO_SLEEP 600
+#define ONBOARD_LED 2
 
 uint8_t espMacAddress[12];
 char deviceId[20];
@@ -41,20 +42,39 @@ void printWakeupReason(){
   Connect to WiFi
   Attempts to establish a wireless connection using the 
   SSID and Password provided in the config.h file.
+
+  @return bool
+    true when WiFi is connected
+    false when unable to connect to WiFi
 */
-void connectToWiFi() {
+bool connectToWiFi() {
   Serial.print("Connecting to ");
   Serial.println(wifiSSID);
 
   WiFi.begin(wifiSSID, wifiPassword);
 
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
+  /* Attempt to Connect to WiFi */
+  int reattemptCount = 0;
+  do {
     delay(500);
-  }
+    Serial.print(".");
 
-  Serial.print("Connected. IP: ");
-  Serial.println(WiFi.localIP());
+    /* Increment Count */
+    reattemptCount += 1;
+  } while (reattemptCount < 10 && WiFi.status() != WL_CONNECTED);
+
+  
+  /* Return */
+  if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(ONBOARD_LED, HIGH);
+    Serial.print("Connected. IP: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+  else {
+    Serial.println("Failed to connect to WiFi.");
+    return false;
+  }
 }
 
 
@@ -150,45 +170,50 @@ void logSensorReading() {
 void setup() {
   /* Stream to 115200 */
   Serial.begin(115200);
+  pinMode(ONBOARD_LED, OUTPUT);
 
-  /* Finish Setup */
-  setupDHTSensor();
-  connectToWiFi();
-  assignDeviceId();
+  bool isWiFiSuccess = false;
 
   /* Print Wakeup Reason */
   printWakeupReason();
 
-  /* Configure Wakeup Timer */
-  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * MS_TO_S_FACTOR);
-  Serial.println("Setup ESP32 to sleep for every " + String(TIME_TO_SLEEP) + " Seconds");
+  /* Finish Setup */
+  setupDHTSensor();
+  isWiFiSuccess = connectToWiFi();
+  assignDeviceId();
 
-  /* Measure & Log Temperature and Humidity */
-  int reattemptCount = 0;
-  bool isReadingSuccess = false;
-  do {
-    /* Wait for Sensor */
-    delay(1000);
-    
-    /* Read Sensor Data */
-    isReadingSuccess = readSensorData(NULL);
-
-    /* Increment Count */
-    reattemptCount += 1;
-  } while (reattemptCount < 3 && !isReadingSuccess);
-
-  /* Log Data If Sensor Read Success */
-  if (isReadingSuccess) {
-    logSensorReading();
-  }
-  else {
-    Serial.println("Data could not be read from sensor. Initiate sleep without logging data.");
+  if (isWiFiSuccess) {
+    /* Measure & Log Temperature and Humidity */
+    int reattemptCount = 0;
+    bool isReadingSuccess = false;
+    do {
+      /* Wait for Sensor */
+      delay(1000);
+      
+      /* Read Sensor Data */
+      isReadingSuccess = readSensorData(NULL);
+  
+      /* Increment Count */
+      reattemptCount += 1;
+    } while (reattemptCount < 3 && !isReadingSuccess);
+  
+    /* Log Data If Sensor Read Success */
+    if (isReadingSuccess) {
+      logSensorReading();
+    }
+    else {
+      Serial.println("Data could not be read from sensor. Initiate sleep without logging data.");
+    }
   }
 
   /* Enter Deep Sleep */
+  /* Configure Wakeup Timer */
+  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * MS_TO_S_FACTOR);
+  Serial.println("Setup ESP32 to sleep for every " + String(TIME_TO_SLEEP) + " Seconds");
   Serial.println("Going to sleep now");
   delay(1000);
   Serial.flush(); 
+  digitalWrite(ONBOARD_LED, LOW);
   esp_deep_sleep_start();
 }
 
