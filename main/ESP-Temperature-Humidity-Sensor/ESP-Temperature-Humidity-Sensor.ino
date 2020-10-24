@@ -1,7 +1,11 @@
 #include <WiFi.h>
 #include "config.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 #include <DHTesp.h>
 #include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include "esp32-hal-cpu.h"
 
 /* Declare Environment Variables */
 DHTesp dht;
@@ -10,12 +14,12 @@ float temperature;
 float humidity;
 
 #define MS_TO_S_FACTOR 1000000
-#define TIME_TO_SLEEP 600
-#define ONBOARD_LED 2
+#define TIME_TO_SLEEP 1800 /* 30 Min */
 
 uint8_t espMacAddress[12];
 char deviceId[20];
 
+StaticJsonDocument<200> requestBody;
 
 /*
   Print Wakeup Reason
@@ -51,6 +55,9 @@ bool connectToWiFi() {
   Serial.print("Connecting to ");
   Serial.println(wifiSSID);
 
+  /* Settle Voltage Before WiFi Pull */
+  delay(5000);
+  
   WiFi.begin(wifiSSID, wifiPassword);
 
   /* Attempt to Connect to WiFi */
@@ -66,7 +73,6 @@ bool connectToWiFi() {
   
   /* Return */
   if (WiFi.status() == WL_CONNECTED) {
-    digitalWrite(ONBOARD_LED, HIGH);
     Serial.print("Connected. IP: ");
     Serial.println(WiFi.localIP());
     return true;
@@ -99,7 +105,7 @@ void assignDeviceId() {
 */
 void setupDHTSensor() {
   // Pin
-  int dhtPin = 4;
+  int dhtPin = 14;
 
   // Initialize Sensor
   dht.setup(dhtPin, DHTesp::DHT22);
@@ -116,7 +122,7 @@ void setupDHTSensor() {
     true when temperature and values provided
     false when sensor data could not be read
 */
-bool readSensorData(void * parameter) {
+bool readSensorData() {
 
   /* Query for Sensor Data */
   Serial.println("Reading sensor data");
@@ -131,7 +137,9 @@ bool readSensorData(void * parameter) {
   /* Store Values */
   temperature = lastValues.temperature;
   humidity = lastValues.humidity;
-  Serial.println("Sensor values updated");
+  Serial.println("Sensor values set");
+  Serial.println(lastValues.temperature);
+  Serial.println(lastValues.humidity);
 
   return true;
 }
@@ -141,24 +149,38 @@ bool readSensorData(void * parameter) {
   Log Sensor Reading
   POSTs sensor data to cloud database.
 */
-void logSensorReading() {
+void logSensorReading(String reading) {
 
   /* Check WiFi is Connected */
     if(WiFi.status()== WL_CONNECTED){
       HTTPClient http;
+      String jsonStr;
+      int httpResponseCode;
 
       /* Open HTTP Session */
-      http.begin(database);
+      if (reading == "temperature") {
+        http.begin(databaseTemperature);
+        requestBody["value"] = temperature;
+      }
+      else {
+        http.begin(databaseHumidity);
+        requestBody["value"] = humidity;
+      }
+      
 
       /* Build Request */
       http.addHeader("Content-Type", "application/json");
-      int httpResponseCode = http.POST("{\"value\":\"" + String(temperature, 2) + "\",\"unit\":\"C\",\"type\":\"T\",\"deviceId\":\"" + deviceId + "\"}");
-      http.POST("{\"value\":\"" + String(humidity, 2) + "\",\"unit\":\"R\",\"type\":\"H\",\"deviceId\":\"" + deviceId + "\"}");
+      requestBody["device_mac_address"] = deviceId;
+      serializeJson(requestBody, jsonStr);
+      serializeJson(requestBody, Serial);
 
+      httpResponseCode = http.POST(jsonStr);
       Serial.print("HTTP Response code: ");
       Serial.println(httpResponseCode);
 
       /* Free resources */
+      requestBody.clear();
+      httpResponseCode = 0;
       http.end();
     }
     else {
@@ -168,9 +190,11 @@ void logSensorReading() {
 
 
 void setup() {
+  /* Lower CPU Clock to 80 Mhz */
+  setCpuFrequencyMhz(80);
+  
   /* Stream to 115200 */
   Serial.begin(115200);
-  pinMode(ONBOARD_LED, OUTPUT);
 
   bool isWiFiSuccess = false;
 
@@ -179,31 +203,39 @@ void setup() {
 
   /* Finish Setup */
   setupDHTSensor();
-  isWiFiSuccess = connectToWiFi();
   assignDeviceId();
 
-  if (isWiFiSuccess) {
-    /* Measure & Log Temperature and Humidity */
-    int reattemptCount = 0;
-    bool isReadingSuccess = false;
-    do {
-      /* Wait for Sensor */
-      delay(1000);
-      
-      /* Read Sensor Data */
-      isReadingSuccess = readSensorData(NULL);
-  
-      /* Increment Count */
-      reattemptCount += 1;
-    } while (reattemptCount < 3 && !isReadingSuccess);
-  
-    /* Log Data If Sensor Read Success */
-    if (isReadingSuccess) {
-      logSensorReading();
+  /* Measure & Log Temperature and Humidity */
+  int reattemptCount = 0;
+  bool isReadingSuccess = false;
+  do {
+    /* Wait for Sensor */
+    delay(1000);
+    
+    /* Read Sensor Data */
+    isReadingSuccess = readSensorData();
+
+    /* Increment Count */
+    reattemptCount += 1;
+  } while (reattemptCount < 3 && !isReadingSuccess);
+
+  /* Log Data If Sensor Read Success */
+  if (isReadingSuccess) {
+    /* Attempt to connect to WiFi after a successful read */
+    uint32_t brown_reg_temp = READ_PERI_REG(RTC_CNTL_BROWN_OUT_REG); //save WatchDog register
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //disable brownout detector
+    isWiFiSuccess = connectToWiFi();
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, brown_reg_temp); //enable brownout detector
+    if (isWiFiSuccess) {
+      logSensorReading("temperature");
+      logSensorReading("humidity");
     }
     else {
-      Serial.println("Data could not be read from sensor. Initiate sleep without logging data.");
+      Serial.println("WiFi not established after sensor read. Initiate sleep without logging data.");
     }
+  }
+  else {
+    Serial.println("Data could not be read from sensor. Initiate sleep without logging data.");
   }
 
   /* Enter Deep Sleep */
@@ -211,9 +243,8 @@ void setup() {
   esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * MS_TO_S_FACTOR);
   Serial.println("Setup ESP32 to sleep for every " + String(TIME_TO_SLEEP) + " Seconds");
   Serial.println("Going to sleep now");
-  delay(1000);
-  Serial.flush(); 
-  digitalWrite(ONBOARD_LED, LOW);
+  delay(500);
+  Serial.flush();
   esp_deep_sleep_start();
 }
 
